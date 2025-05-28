@@ -2,7 +2,6 @@
 const { createClient } = require("@supabase/supabase-js");
 const twilio = require("twilio");
 
-// Supabase and Twilio config from environment variables
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
@@ -14,10 +13,6 @@ const twilioClient = twilio(
 
 const WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
 
-/**
- * Fuzzy parse a WhatsApp MVT flight message into a row object for Supabase.
- * Supports real-world imperfect formatting and both message sample styles.
- */
 function parseFlightMessage(message) {
   // Normalize whitespace, remove CORR or any leading labels
   message = message
@@ -38,7 +33,10 @@ function parseFlightMessage(message) {
 
   // Parse lines: Example "IAN521 250527 5N-CEE"
   let infoLine = lines.find(l => /^[A-Z]{3}\d{3}\s+\d{6}/.test(l));
-  if (!infoLine) return null;
+  if (!infoLine) {
+    console.log("❌ Could not find infoLine in message:", message);
+    return null;
+  }
   let [flightNo, dateStr, aircraftCode] = infoLine.split(/\s+/);
   flight_no = flightNo || "";
   aircraft = aircraftCode || "";
@@ -56,7 +54,7 @@ function parseFlightMessage(message) {
     route = routeLine;
   }
 
-  // Parse STD/ATD and remarks (look for "C/O:", "TXI:", "A/B:")
+  // Parse STD/ATD and remarks
   for (let l of lines) {
     let stdMatch = l.match(/C\/O:\s*([\d]{3,4})z?/i);
     if (stdMatch) std = stdMatch[1].replace(/^(\d{2})(\d{2})$/, "$1:$2");
@@ -97,7 +95,7 @@ function parseFlightMessage(message) {
   }
 
   // Compose final object
-  return {
+  const rowObj = {
     flight_date,
     flight_no,
     aircraft,
@@ -115,10 +113,15 @@ function parseFlightMessage(message) {
     infant,
     total_pax
   };
+
+  console.log("Parsed row object:", rowObj);
+  return rowObj;
 }
 
 // -------- Main Handler --------
 module.exports = async (req, res) => {
+  console.log("Incoming Twilio webhook:", req.body);
+
   // Twilio webhook sends as x-www-form-urlencoded!
   let body = req.body;
   if (typeof body === "string") {
@@ -130,6 +133,7 @@ module.exports = async (req, res) => {
 
   // Only handle WhatsApp
   if (!msg || !from || !from.startsWith("whatsapp:")) {
+    console.log("❌ Not a WhatsApp message or missing fields:", { msg, from });
     res.status(400).send("Bad request");
     return;
   }
@@ -138,29 +142,34 @@ module.exports = async (req, res) => {
   let parsed = parseFlightMessage(msg);
   let reply = "";
   if (!parsed || !parsed.flight_no || !parsed.flight_date) {
+    console.log("❌ Parse failed. Parsed object:", parsed);
     reply = "❌ Error: Could not parse flight message. Check your format.";
   } else {
     // Upsert into Supabase
+    console.log("Upserting into Supabase:", parsed);
     const { error } = await supabase
       .from("flights")
       .upsert([parsed], { onConflict: ["flight_no", "flight_date"] });
     reply = error
       ? "❌ Error: Could not save flight record."
       : "✅ MVT message received and stored!";
+    if (error) console.log("❌ Supabase error:", error);
+    else console.log("✅ Supabase upsert successful");
   }
 
   // Respond via Twilio WhatsApp
   try {
+    console.log("Sending reply to WhatsApp:", reply);
     await twilioClient.messages.create({
       from: WHATSAPP_NUMBER,
       to: from,
       body: reply
     });
+    console.log("✅ Reply sent to WhatsApp user:", from);
   } catch (err) {
+    console.log("❌ Twilio reply failed:", err);
     // Twilio reply failed, but always 200 to webhook (Twilio best practice)
-    // Optionally log err
   }
 
   res.status(200).send("OK");
 };
-
