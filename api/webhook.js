@@ -13,7 +13,7 @@ const twilioClient = twilio(
 
 const WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
 
-function parseFlightMessage(message) {
+unction parseFlightMessage(message) {
   // Normalize whitespace, remove CORR or any leading labels
   message = message
     .replace(/^CORR\s*/i, "")
@@ -22,7 +22,7 @@ function parseFlightMessage(message) {
     .replace(/\n{2,}/g, "\n")
     .trim();
 
-  // Grab lines for processing
+  // Split into lines, trim, remove empties
   const lines = message.split("\n").map(l => l.trim()).filter(Boolean);
 
   // Defaults
@@ -31,7 +31,7 @@ function parseFlightMessage(message) {
   let premium = null, economy = null, infant = null, total_pax = null, capacity = null;
   let route = "";
 
-  // Parse lines: Example "IAN521 250527 5N-CEE"
+  // Info line: e.g., "IAN521 250527 5N-CEE"
   let infoLine = lines.find(l => /^[A-Z]{3}\d{3}\s+\d{6}/.test(l));
   if (!infoLine) {
     console.log("❌ Could not find infoLine in message:", message);
@@ -47,46 +47,61 @@ function parseFlightMessage(message) {
     flight_date = `20${yy}-${mm}-${dd}`;
   }
 
-  // Parse route, e.g. "ABV-QUO"
+  // Route line, e.g. "ABV-LOS"
   let routeLine = lines.find(l => /^[A-Z]{3,4}-[A-Z]{3,4}/.test(l));
   if (routeLine) {
     [departure, arrival] = routeLine.split("-");
     route = routeLine;
   }
 
-  // Parse STD/ATD and remarks
+  // Parse STD/ATD, allow for C/O, STD, ATD, A/B, and other possible labels
   for (let l of lines) {
-    let stdMatch = l.match(/C\/O:\s*([\d]{3,4})z?/i);
-    if (stdMatch) std = stdMatch[1].replace(/^(\d{2})(\d{2})$/, "$1:$2");
+    // STD (C/O, STD)
+    let stdMatch = l.match(/(?:C\/O|STD)[:\s]*([0-2][0-9])[:]?([0-5][0-9])?/i);
+    if (stdMatch) std = stdMatch[2] ? `${stdMatch[1]}:${stdMatch[2]}` : stdMatch[1];
 
-    let atdMatch = l.match(/A\/B:\s*([\d]{3,4})z?/i);
-    if (atdMatch) atd = atdMatch[1].replace(/^(\d{2})(\d{2})$/, "$1:$2");
-
-    // Some formats use "DEP:" or "STD:" as labels—catch those too
-    let depMatch = l.match(/STD:\s*([\d]{2}):?([\d]{2})/i);
-    if (depMatch) std = `${depMatch[1]}:${depMatch[2]}`;
-    let actDepMatch = l.match(/ATD:\s*([\d]{2}):?([\d]{2})/i);
-    if (actDepMatch) atd = `${actDepMatch[1]}:${actDepMatch[2]}`;
+    // ATD (A/B, ATD)
+    let atdMatch = l.match(/(?:A\/B|ATD)[:\s]*([0-2][0-9])[:]?([0-5][0-9])?/i);
+    if (atdMatch) atd = atdMatch[2] ? `${atdMatch[1]}:${atdMatch[2]}` : atdMatch[1];
   }
 
-  // Parse PAX: (77)07/70, or (77)07/77, or "PAX: 08/70"
+  // Parse PAX lines, e.g.:
+  // - PAX: (130)09/120+01inf
+  // - PAX: (77)07/70
+  // - PAX: 09/120+01inf
+  // - PAX: 09/120
   let paxLine = lines.find(l => /PAX[:\.]/i.test(l));
   if (paxLine) {
-    let match = paxLine.match(/\(?(\d+)\)?\s*(\d{1,2})\/(\d{2,3})/);
+    // PAX: (130)09/120+01inf
+    let match = paxLine.match(/\(?(\d+)\)?\s*(\d{1,2})\/(\d{2,3})(\+(\d{1,2})(inf|INF))?/);
     if (match) {
-      total_pax = parseInt(match[1], 10); // e.g. 77
-      infant = parseInt(match[2], 10); // e.g. 07
-      capacity = parseInt(match[3], 10); // e.g. 70
-    }
-    // Fallback for PAX: 08/70 (Premium/Economy style)
-    let match2 = paxLine.match(/PAX[:\.]\s*(\d{1,2})\/(\d{2,3})/i);
-    if (match2) {
-      premium = parseInt(match2[1], 10);
-      economy = parseInt(match2[2], 10);
+      total_pax = parseInt(match[1], 10);
+      premium = parseInt(match[2], 10);
+      economy = parseInt(match[3], 10);
+      // Infant can be after a "+", e.g., "+01inf"
+      if (match[5]) infant = parseInt(match[5], 10);
+      capacity = economy;
+    } else {
+      // fallback for PAX: 08/70 (Premium/Economy style)
+      let fallback = paxLine.match(/PAX[:\.]?\s*(\d{1,2})\/(\d{2,3})/i);
+      if (fallback) {
+        premium = parseInt(fallback[1], 10);
+        economy = parseInt(fallback[2], 10);
+        capacity = economy;
+      }
+      // Find infant as "+01inf" anywhere
+      let infFallback = paxLine.match(/\+(\d{1,2})(inf|INF)/);
+      if (infFallback) infant = parseInt(infFallback[1], 10);
     }
   }
 
-  // Parse "CREW:" (ignore), parse "SI:" for remarks
+  // "DLY:" or "DLY: REACTIONARY" for delay reason
+  let dlyLine = lines.find(l => /^DLY[:\.]/i.test(l));
+  if (dlyLine) {
+    delay_reason = dlyLine.replace(/^DLY[:\.]\s*/i, "");
+  }
+
+  // Remarks/other fields
   for (let l of lines) {
     if (/^SI:/i.test(l)) remark = l.replace(/^SI:\s*/i, "");
     if (/^Remark[:\.]/i.test(l)) remark = l.replace(/^Remark[:\.]\s*/i, "");
@@ -94,7 +109,7 @@ function parseFlightMessage(message) {
     if (/^Schedule Status[:\.]/i.test(l)) schedule_status = l.replace(/^Schedule Status[:\.]\s*/i, "");
   }
 
-  // Compose final object
+  // Compose and log result
   const rowObj = {
     flight_date,
     flight_no,
@@ -113,7 +128,6 @@ function parseFlightMessage(message) {
     infant,
     total_pax
   };
-
   console.log("Parsed row object:", rowObj);
   return rowObj;
 }
