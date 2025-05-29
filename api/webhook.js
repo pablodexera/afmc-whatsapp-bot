@@ -1,4 +1,3 @@
-// api/webhook.js
 const { createClient } = require("@supabase/supabase-js");
 const twilio = require("twilio");
 
@@ -13,6 +12,13 @@ const twilioClient = twilio(
 
 const WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
 
+// Helper: Parse time ("HH:MM") to minutes
+function parseMinutes(t) {
+  if (!t || !/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) return null;
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+}
+
 function parseFlightMessage(message) {
   message = message
     .replace(/^CORR\s*/i, "")
@@ -24,7 +30,7 @@ function parseFlightMessage(message) {
   const lines = message.split("\n").map(l => l.trim()).filter(Boolean);
 
   let flight_no = "", flight_date = null, aircraft = "", departure = "", arrival = "";
-  let std = "", atd = "", remark = "", delay_reason = "", schedule_status = "";
+  let std = "", atd = "", remark = "", delay_reason = "", schedule_status = "On Schedule";
   let premium = null, economy = null, infant = null, total_pax = null, capacity = null;
   let route = "";
 
@@ -45,7 +51,7 @@ function parseFlightMessage(message) {
   let routeLine = lines.find(l => /^[A-Z]{3,4}-[A-Z]{3,4}/.test(l));
   if (routeLine) {
     [departure, arrival] = routeLine.split("-");
-    route = routeLine;
+    route = `${departure}-${arrival}`;
   }
 
   for (let l of lines) {
@@ -77,6 +83,13 @@ function parseFlightMessage(message) {
     }
   }
 
+  // Always: total_pax = premium + economy + infant, unless original value is present and higher
+  let sum_pax = 0;
+  if (premium != null) sum_pax += premium;
+  if (economy != null) sum_pax += economy;
+  if (infant != null) sum_pax += infant;
+  if (!total_pax || sum_pax > total_pax) total_pax = sum_pax;
+
   let dlyLine = lines.find(l => /^DLY[:\.]/i.test(l));
   if (dlyLine) {
     delay_reason = dlyLine.replace(/^DLY[:\.]\s*/i, "");
@@ -88,6 +101,20 @@ function parseFlightMessage(message) {
     if (/^Delay Reason[:\.]/i.test(l)) delay_reason = l.replace(/^Delay Reason[:\.]\s*/i, "");
     if (/^Schedule Status[:\.]/i.test(l)) schedule_status = l.replace(/^Schedule Status[:\.]\s*/i, "");
   }
+
+  // Remark: based on delay between STD and ATD (if both available)
+  if (std && atd) {
+    let stdMins = parseMinutes(std);
+    let atdMins = parseMinutes(atd);
+    if (stdMins != null && atdMins != null) {
+      let diff = atdMins - stdMins;
+      if (diff > 15) remark = "Delayed";
+      else remark = "On time";
+    }
+  }
+
+  // Always recalc route
+  route = `${departure}-${arrival}`;
 
   const rowObj = {
     flight_date,
@@ -109,6 +136,32 @@ function parseFlightMessage(message) {
   };
   console.log("Parsed row object:", rowObj);
   return rowObj;
+}
+
+// Format the field summary for WhatsApp
+function buildFieldSummary(rowObj) {
+  const labels = {
+    flight_date: "Date",
+    flight_no: "Flight No",
+    aircraft: "Aircraft",
+    capacity: "Capacity",
+    departure: "Departure",
+    arrival: "Arrival",
+    route: "Route",
+    std: "STD",
+    atd: "ATD",
+    remark: "Remark",
+    delay_reason: "Delay Reason",
+    schedule_status: "Schedule Status",
+    premium: "Premium",
+    economy: "Economy",
+    infant: "Infant",
+    total_pax: "Total Pax"
+  };
+  return Object.entries(rowObj)
+    .filter(([k, v]) => v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => `• ${labels[k] || k}: ${v}`)
+    .join("\n");
 }
 
 // -------- Main Handler --------
@@ -153,13 +206,14 @@ module.exports = async (req, res) => {
         .from("flights")
         .upsert([parsed], { onConflict: ["flight_no", "flight_date"] });
 
+      let fieldSummary = buildFieldSummary(parsed);
       if (upsertError) {
         reply = "❌ Error: Could not save flight record.";
         console.log("❌ Supabase upsert error:", upsertError);
       } else if (existing) {
-        reply = `✏️ Existing flight record updated: ${parsed.flight_no} (${parsed.flight_date})`;
+        reply = `✏️ Existing flight record updated:\n${fieldSummary}`;
       } else {
-        reply = `✅ New flight record added: ${parsed.flight_no} (${parsed.flight_date})`;
+        reply = `✅ New flight record added:\n${fieldSummary}`;
       }
     }
   }
